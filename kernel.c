@@ -1,5 +1,5 @@
 /* Widhy OS v2 - kernel 64-bit, grafis 640x480 ala TempleOS
- * Fitur: framebuffer, font, konsol teks, IDT, PIC, timer,
+ * Fitur: framebuffer, font, konsol teks, IDT, PIC, timer 100Hz,
  *        keyboard (+panah, Ctrl, ESC), mouse PS/2 + pointer,
  *        disk ATA + filesystem WFS2 (persistent, bertingkat/folder),
  *        perintah: pwd cd mkdir rmdir ls cat write append cp mv rm nano
@@ -14,18 +14,23 @@
  *                    mouse_x mouse_y mouse_btn mouse_hide mouse_show
  *                    panel_save panel_restore
  *                    ui_button ui_button_hit
+ *                    gfx_buf gfx_flip pal_set pal_reset
  *          - #include "file.wc" (rekursif, maks 3 level)
  *          wcc <sumber> [keluaran]  -> kompilasi -> simpan ke DISK
  *          wrun [berkas]            -> muat dari DISK lalu jalankan
- *          mario                    -> game grafis (pixel)
+ *          mario                    -> game grafis (pixel) v3
  *          paint [nama.wpg]         -> MS Paint-like, simpan .wpg
  *
- * DESAIN PENTING: handler interrupt TIDAK menggambar apa-apa. */
+ * DESAIN PENTING: handler interrupt TIDAK menggambar apa-apa.
+ *
+ * Mario (mario.wc) sudah ditanam langsung di berkas ini (mario_src).
+ */
 #include <stdint.h>
 #include <time.h>
 #include "speaker.h"
 #include "rtc.h"
 #define PIT_FREQ 1193180
+#define TICK_HZ  100
 
 #define WC_CODE      0x100000
 #define WC_DATA      0x110000
@@ -85,6 +90,8 @@ void speaker_beep(uint32_t freq, uint32_t ms) {
  * 2. GRAFIS
  * ============================================================ */
 static volatile uint8_t *fb;
+static volatile uint8_t *gd;      /* target gambar: fb atau back buffer */
+#define BACKBUF 0x140000
 static int pitch, width, height;
 static const uint8_t *font = (const uint8_t *)0x60000;
 
@@ -114,18 +121,19 @@ static void gfx_init(void) {
     width  = *(uint16_t *)(mi + 0x12);
     height = *(uint16_t *)(mi + 0x14);
     fb     = (volatile uint8_t *)(uint64_t)*(uint32_t *)(mi + 0x28);
+    gd     = fb;
     set_palette();
 }
 static void fill_rect(int x, int y, int w, int h, uint8_t color) {
     for (int j = 0; j < h; j++)
         for (int i = 0; i < w; i++)
-            fb[(y + j) * pitch + x + i] = color;
+            gd[(y + j) * pitch + x + i] = color;
 }
 static void draw_glyph(int px, int py, uint8_t c, uint8_t fg, uint8_t bg) {
     const uint8_t *g = font + c * CH;
     for (int r = 0; r < CH; r++) {
         uint8_t bits = g[r];
-        volatile uint8_t *row = fb + (py + r) * pitch + px;
+        volatile uint8_t *row = gd + (py + r) * pitch + px;
         for (int b = 0; b < CW; b++)
             row[b] = (bits & (0x80 >> b)) ? fg : bg;
     }
@@ -381,7 +389,7 @@ static void idt_init(void) {
 }
 
 /* ============================================================
- * 6. PIC
+ * 6. PIC + PIT
  * ============================================================ */
 static void pic_init(void) {
     outb(0x20, 0x11); outb(0xA0, 0x11);
@@ -390,6 +398,12 @@ static void pic_init(void) {
     outb(0x21, 0x01); outb(0xA1, 0x01);
     outb(0x21, 0xF8);
     outb(0xA1, 0xEF);
+}
+static void pit_init(void) {
+    uint32_t d = PIT_FREQ / TICK_HZ;
+    outb(0x43, 0x36);
+    outb(0x40, d & 0xFF);
+    outb(0x40, (d >> 8) & 0xFF);
 }
 
 /* ============================================================
@@ -518,6 +532,7 @@ static int strncmp_(const char *a, const char *b, int n) {
 static volatile uint64_t ticks = 0;
 void interrupt_dispatch(uint64_t vector) {
     if (vector < 32) {
+        gd = fb;
         con_color(WHITE, RED);
         con_puts("\n*** EXCEPTION ");
         con_hex(vector);
@@ -611,7 +626,7 @@ static uint64_t clock_last = 0;
 static int clock_ok = 0;
 static char clock_str[20];
 static void clock_tick(void) {
-    if (clock_ok && ticks - clock_last < 9) return;
+    if (clock_ok && ticks - clock_last < TICK_HZ / 2) return;
     clock_last = ticks;
     clock_ok = 1;
     rtc_time_t t;
@@ -1603,7 +1618,7 @@ static void widhy_cursor(long on) {
 }
 static void widhy_delay(long ms) {
     if (ms <= 0) return;
-    uint64_t need = ((uint64_t)ms * 18 + 999) / 1000;
+    uint64_t need = ((uint64_t)ms * TICK_HZ + 999) / 1000;
     if (need < 1) need = 1;
     uint64_t start = ticks;
     while ((ticks - start) < need) __asm__ volatile ("pause");
@@ -1617,7 +1632,7 @@ static long widhy_key_down(long sc) {
 static void widhy_gfx_clear(long color) {
     uint8_t c = (uint8_t)(color & 0xFF);
     for (int y = 16; y < height; y++) {
-        volatile uint8_t *row = fb + y * pitch;
+        volatile uint8_t *row = gd + y * pitch;
         for (int x = 0; x < width; x++) row[x] = c;
     }
 }
@@ -1629,9 +1644,10 @@ static void widhy_gfx_rect(long x, long y, long w, long h, long color) {
     if (px + pw > width)  pw = width - px;
     if (py + ph > height) ph = height - py;
     if (pw <= 0 || ph <= 0) return;
-    for (int j = 0; j < ph; j++)
-        for (int i = 0; i < pw; i++)
-            fb[(py+j)*pitch + px+i] = c;
+    for (int j = 0; j < ph; j++) {
+        volatile uint8_t *r = gd + (py + j) * pitch + px;
+        for (int i = 0; i < pw; i++) r[i] = c;
+    }
 }
 static void widhy_gfx_frame(long x, long y, long w, long h, long color) {
     widhy_gfx_rect(x, y, w, 1, color);
@@ -1707,8 +1723,28 @@ static long widhy_ui_button_hit(long x, long y, long w, long h) {
     return 0;
 }
 
+/* --- double buffering + palet --- */
+static void widhy_gfx_buf(long on) { gd = on ? (volatile uint8_t *)BACKBUF : fb; }
+static void widhy_gfx_flip(void) {
+    if (gd == fb) return;
+    for (int y = 16; y < height; y++) {
+        volatile uint64_t *d = (volatile uint64_t *)(fb + y * pitch);
+        volatile uint64_t *s = (volatile uint64_t *)(gd + y * pitch);
+        for (int i = 0; i < width / 8; i++) d[i] = s[i];
+    }
+}
+static void widhy_pal_set(long i, long r, long g, long b) {
+    if (i < 0 || i > 15) return;
+    outb(0x3C8, (uint8_t)i);
+    outb(0x3C9, (uint8_t)(r & 63));
+    outb(0x3C9, (uint8_t)(g & 63));
+    outb(0x3C9, (uint8_t)(b & 63));
+}
+static void widhy_pal_reset(void) { set_palette(); }
+
 struct wc_bi { const char *name; void *fn; int nargs; };
 static void wc_bi_print(const char *s) { con_puts(s); }
+/* URUTAN JANGAN DIUBAH: tambahkan builtin baru hanya di AKHIR tabel */
 static const struct wc_bi wc_builtins[] = {
     { "print",      (void*)wc_bi_print,      1 },
     { "print_int",  (void*)widhy_print_int,  1 },
@@ -1738,6 +1774,10 @@ static const struct wc_bi wc_builtins[] = {
     { "panel_restore", (void*)widhy_panel_restore, 0 },
     { "ui_button",     (void*)widhy_ui_button,     7 },
     { "ui_button_hit", (void*)widhy_ui_button_hit, 4 },
+    { "gfx_buf",   (void*)widhy_gfx_buf,   1 },
+    { "gfx_flip",  (void*)widhy_gfx_flip,  0 },
+    { "pal_set",   (void*)widhy_pal_set,   4 },
+    { "pal_reset", (void*)widhy_pal_reset, 0 },
 };
 #define WC_NBUILTIN ((int)(sizeof(wc_builtins)/sizeof(wc_builtins[0])))
 static int wc_builtin_idx(const char *n) {
@@ -1748,10 +1788,10 @@ static int wc_builtin_idx(const char *n) {
 
 #define WC_HDR       20
 #define WC_MAXFN     32
-#define WC_MAXREL    256
+#define WC_MAXREL    1024
 #define WC_MAXVAR    64
-#define WC_MAXLABEL  256
-#define WC_MAXJUMP   1024
+#define WC_MAXLABEL  2048
+#define WC_MAXJUMP   4096
 #define WC_SRCBUF    16384
 
 #define WCX_MAGIC_0 'W'
@@ -2700,569 +2740,376 @@ static void cmd_wrun(const char *args) {
     }
     void (*f)(void) = (void (*)(void))(dc + moff);
     f();
+    gd = fb;   /* jaga-jaga jika program lupa gfx_buf(0) */
 }
 
-
-
-
 /* ============================================================
- * 9f-b. MARIO (embedded .wc) -- VERSI BARU: grafik bagus + kaki animasi
+ * 9f-b. MARIO (embedded .wc, dari mario_src.h)
  * ============================================================ */
 static const char mario_src[] =
-"void draw_mario(int px, int py, int phase, int facing, int jumping) {\n"
-"    int skin;\n"
-"    int hat;\n"
-"    int shirt;\n"
-"    int pants;\n"
-"    int shoe;\n"
-"    int eye_x;\n"
-"    skin = 14;\n"
-"    hat = 4;\n"
-"    shirt = 4;\n"
-"    pants = 1;\n"
-"    shoe = 6;\n"
-"\n"
-"    gfx_rect(px + 4, py - 48, 24, 4, hat);\n"
-"    gfx_rect(px + 2, py - 44, 28, 6, hat);\n"
-"    gfx_rect(px + 8, py - 47, 6, 2, 15);\n"
-"\n"
-"    gfx_rect(px + 6, py - 38, 22, 12, skin);\n"
-"\n"
-"    if (facing > 0) { eye_x = px + 18; } else { eye_x = px + 10; }\n"
-"    gfx_rect(eye_x, py - 36, 3, 4, 0);\n"
-"\n"
-"    if (facing > 0) {\n"
-"        gfx_rect(px + 14, py - 30, 14, 3, 6);\n"
-"    } else {\n"
-"        gfx_rect(px + 6, py - 30, 14, 3, 6);\n"
-"    }\n"
-"\n"
-"    gfx_rect(px + 4, py - 26, 26, 10, shirt);\n"
-"    gfx_rect(px + 6, py - 22, 22, 10, pants);\n"
-"    gfx_rect(px + 8, py - 20, 4, 4, 14);\n"
-"    gfx_rect(px + 20, py - 20, 4, 4, 14);\n"
-"\n"
-"    if (facing > 0) {\n"
-"        gfx_rect(px + 28, py - 24, 6, 8, shirt);\n"
-"        gfx_rect(px + 30, py - 18, 6, 6, skin);\n"
-"        gfx_rect(px, py - 24, 4, 8, shirt);\n"
-"    } else {\n"
-"        gfx_rect(px - 2, py - 24, 6, 8, shirt);\n"
-"        gfx_rect(px - 4, py - 18, 6, 6, skin);\n"
-"        gfx_rect(px + 28, py - 24, 4, 8, shirt);\n"
-"    }\n"
-"\n"
-"    if (jumping == 1) {\n"
-"        gfx_rect(px + 6, py - 12, 8, 8, pants);\n"
-"        gfx_rect(px + 18, py - 12, 8, 8, pants);\n"
-"        gfx_rect(px + 4, py - 4, 10, 4, shoe);\n"
-"        gfx_rect(px + 18, py - 4, 10, 4, shoe);\n"
-"    } else if (phase == 0) {\n"
-"        gfx_rect(px + 6, py - 12, 8, 12, pants);\n"
-"        gfx_rect(px + 18, py - 12, 8, 12, pants);\n"
-"        gfx_rect(px + 4, py, 10, 4, shoe);\n"
-"        gfx_rect(px + 18, py, 10, 4, shoe);\n"
-"    } else if (phase == 1) {\n"
-"        gfx_rect(px + 4, py - 12, 8, 12, pants);\n"
-"        gfx_rect(px + 22, py - 12, 8, 8, pants);\n"
-"        gfx_rect(px + 22, py - 6, 8, 4, pants);\n"
-"        gfx_rect(px + 2, py, 10, 4, shoe);\n"
-"        gfx_rect(px + 24, py - 2, 10, 4, shoe);\n"
-"    } else {\n"
-"        gfx_rect(px + 8, py - 12, 8, 8, pants);\n"
-"        gfx_rect(px + 8, py - 6, 8, 4, pants);\n"
-"        gfx_rect(px + 16, py - 12, 8, 12, pants);\n"
-"        gfx_rect(px + 6, py - 2, 10, 4, shoe);\n"
-"        gfx_rect(px + 20, py, 10, 4, shoe);\n"
-"    }\n"
+"// MARIO WIDHY v3\n"
+"int mc(int d) {\n"
+" if (d==1) return 4;\n"
+" if (d==2) return 8;\n"
+" if (d==3) return 6;\n"
+" if (d==4) return 1;\n"
+" if (d==5) return 14;\n"
+" if (d==6) return 15;\n"
+" if (d==8) return 5;\n"
+" if (d==9) return 12;\n"
+" return 0;\n"
 "}\n"
-"\n"
-"void draw_cloud(int x, int y) {\n"
-"    gfx_rect(x, y, 40, 12, 15);\n"
-"    gfx_rect(x + 8, y - 6, 24, 8, 15);\n"
-"    gfx_rect(x + 20, y - 10, 20, 8, 15);\n"
+"void srow(int x,int y,int v,int s,int f) {\n"
+" int i; int d;\n"
+" i=11;\n"
+" while (i>=0) {\n"
+"  d=v%10; v=v/10;\n"
+"  if (d!=0) {\n"
+"   if (f==0) gfx_rect(x+i*s,y,s,s,mc(d)); else gfx_rect(x+(11-i)*s,y,s,s,mc(d));\n"
+"  }\n"
+"  i=i-1;\n"
+" }\n"
 "}\n"
-"\n"
-"void draw_pipe(int x, int y, int h) {\n"
-"    gfx_rect(x, y, 40, 12, 10);\n"
-"    gfx_rect(x + 2, y + 12, 36, h, 2);\n"
-"    gfx_rect(x + 4, y + 14, 6, h - 4, 10);\n"
-"    gfx_frame(x, y, 40, 12, 0);\n"
-"    gfx_rect(x + 2, y + 12, 1, h, 0);\n"
-"    gfx_rect(x + 37, y + 12, 1, h, 0);\n"
+"void mario(int x,int y,int f,int m) {\n"
+" srow(x,y,000001111100,2,f);\n"
+" srow(x,y+2,000011111111,2,f);\n"
+" srow(x,y+4,000033322720,2,f);\n"
+" srow(x,y+6,000323222722,2,f);\n"
+" srow(x,y+8,000332233322,2,f);\n"
+" srow(x,y+10,000002222220,2,f);\n"
+" srow(x,y+12,001114444111,2,f);\n"
+" srow(x,y+14,002114544112,2,f);\n"
+" srow(x,y+16,002224444222,2,f);\n"
+" srow(x,y+18,000044444400,2,f);\n"
+" srow(x,y+20,000044444400,2,f);\n"
+" if (m==0) {\n"
+"  srow(x,y+22,000044004400,2,f);\n"
+"  srow(x,y+24,000044004400,2,f);\n"
+"  srow(x,y+26,000044004400,2,f);\n"
+"  srow(x,y+28,000333003330,2,f);\n"
+"  srow(x,y+30,003333003333,2,f);\n"
+" } else if (m==1) {\n"
+"  srow(x,y+22,000444004440,2,f);\n"
+"  srow(x,y+24,004440000444,2,f);\n"
+"  srow(x,y+26,003330000333,2,f);\n"
+"  srow(x,y+28,033330000333,2,f);\n"
+" } else {\n"
+"  srow(x,y+22,004440004440,2,f);\n"
+"  srow(x,y+24,033440004433,2,f);\n"
+"  srow(x,y+26,033300000333,2,f);\n"
+" }\n"
 "}\n"
-"\n"
-"void draw_question_block(int x, int y, int anim) {\n"
-"    int shade;\n"
-"    shade = 14;\n"
-"    if (anim == 1) shade = 15;\n"
-"    gfx_rect(x, y, 32, 32, shade);\n"
-"    gfx_frame(x, y, 32, 32, 0);\n"
-"    gfx_frame(x + 1, y + 1, 30, 30, 6);\n"
-"    gfx_text(x + 10, y + 8, \"?\", 0);\n"
+"void goomba(int x,int y,int m) {\n"
+" srow(x,y,000003333000,2,0);\n"
+" srow(x,y+2,000033333300,2,0);\n"
+" srow(x,y+4,000333333330,2,0);\n"
+" srow(x,y+6,003366336633,2,0);\n"
+" srow(x,y+8,003367337633,2,0);\n"
+" srow(x,y+10,033333333330,2,0);\n"
+" srow(x,y+12,000099999900,2,0);\n"
+" srow(x,y+14,000099999900,2,0);\n"
+" srow(x,y+16,000099999900,2,0);\n"
+" if (m==0) {\n"
+"  srow(x,y+18,008880008880,2,0);\n"
+"  srow(x,y+20,088888008888,2,0);\n"
+" } else {\n"
+"  srow(x,y+18,000888088800,2,0);\n"
+"  srow(x,y+20,888880000888,2,0);\n"
+" }\n"
 "}\n"
-"\n"
-"void draw_coin(int x, int y, int anim) {\n"
-"    int w;\n"
-"    if (anim == 1) { w = 12; } else { w = 6; }\n"
-"    gfx_rect(x + (12 - w) / 2, y, w, 16, 14);\n"
-"    gfx_frame(x + (12 - w) / 2, y, w, 16, 6);\n"
+"void block(int x,int y,int t) {\n"
+" if (t==0) {\n"
+"  gfx_rect(x,y,32,32,5);\n"
+"  gfx_rect(x+1,y+1,14,6,6); gfx_rect(x+17,y+1,14,6,6);\n"
+"  gfx_rect(x+1,y+9,6,6,6); gfx_rect(x+9,y+9,14,6,6); gfx_rect(x+25,y+9,6,6,6);\n"
+"  gfx_rect(x+1,y+17,14,6,6); gfx_rect(x+17,y+17,14,6,6);\n"
+"  gfx_rect(x+1,y+25,6,6,6); gfx_rect(x+9,y+25,14,6,6); gfx_rect(x+25,y+25,6,6,6);\n"
+"  gfx_rect(x+1,y+1,30,1,12);\n"
+" } else if (t==1) {\n"
+"  gfx_rect(x,y,32,32,0); gfx_rect(x+2,y+2,28,28,14);\n"
+"  gfx_rect(x+2,y+2,28,2,15); gfx_rect(x+2,y+28,28,2,6);\n"
+"  gfx_rect(x+4,y+4,2,2,0); gfx_rect(x+26,y+4,2,2,0);\n"
+"  gfx_rect(x+4,y+26,2,2,0); gfx_rect(x+26,y+26,2,2,0);\n"
+"  gfx_text(x+12,y+8,\"?\",230);\n"
+" } else {\n"
+"  gfx_rect(x,y,32,32,0); gfx_rect(x+2,y+2,28,28,6);\n"
+"  gfx_rect(x+2,y+2,28,2,12); gfx_rect(x+4,y+4,2,2,5); gfx_rect(x+26,y+4,2,2,5);\n"
+"  gfx_rect(x+4,y+26,2,2,5); gfx_rect(x+26,y+26,2,2,5);\n"
+" }\n"
 "}\n"
-"\n"
+"void coin(int x,int y,int f) {\n"
+" int w;\n"
+" w=12;\n"
+" if (f==1 || f==3) w=8;\n"
+" if (f==2) w=4;\n"
+" gfx_rect(x+(12-w)/2,y,w,16,0);\n"
+" gfx_rect(x+(12-w)/2+1,y+1,w-2,14,14);\n"
+" if (f==0) gfx_rect(x+3,y+3,2,8,15);\n"
+"}\n"
+"void cloud(int x,int y) {\n"
+" gfx_rect(x+14,y,36,6,15); gfx_rect(x+6,y+6,52,6,15); gfx_rect(x,y+12,64,6,15);\n"
+" gfx_rect(x,y+18,64,4,3); gfx_rect(x+6,y+22,52,3,3);\n"
+"}\n"
+"void hill(int x,int y,int n) {\n"
+" int j;\n"
+" j=0;\n"
+" while (j<n) {\n"
+"  gfx_rect(x+j*16,y-(j+1)*12,(n-j)*32-16,12,2);\n"
+"  gfx_rect(x+j*16,y-(j+1)*12,(n-j)*32-16,3,10);\n"
+"  j=j+1;\n"
+" }\n"
+"}\n"
+"void bush(int x,int y) {\n"
+" gfx_rect(x+6,y-20,18,20,10); gfx_rect(x+20,y-26,24,26,10);\n"
+" gfx_rect(x+40,y-18,18,18,10); gfx_rect(x+6,y-6,52,6,2);\n"
+"}\n"
+"void flagpole(int x) {\n"
+" gfx_rect(x,240,6,180,15); gfx_rect(x+4,240,2,180,7); gfx_rect(x-2,232,10,8,14);\n"
+" gfx_rect(x-30,246,30,6,4); gfx_rect(x-24,252,24,6,4); gfx_rect(x-18,258,18,6,4);\n"
+" gfx_rect(x-12,264,12,6,4); gfx_rect(x-6,270,6,6,4);\n"
+" gfx_rect(x-8,410,22,10,7);\n"
+" gfx_rect(x+50,350,90,70,5); gfx_rect(x+52,352,86,68,6);\n"
+" gfx_rect(x+50,336,20,14,5); gfx_rect(x+52,338,16,12,6);\n"
+" gfx_rect(x+80,336,20,14,5); gfx_rect(x+82,338,16,12,6);\n"
+" gfx_rect(x+120,336,20,14,5); gfx_rect(x+122,338,16,12,6);\n"
+" gfx_rect(x+82,380,26,40,0); gfx_rect(x+86,374,18,8,0);\n"
+"}\n"
+"void sky() {\n"
+" int i;\n"
+" gfx_rect(0,16,640,130,9);\n"
+" gfx_rect(0,146,640,110,11);\n"
+" gfx_rect(0,256,640,224,13);\n"
+" i=0;\n"
+" while (i<4) {\n"
+"  gfx_rect(0,130+i*4,640,i+1,11);\n"
+"  gfx_rect(0,240+i*4,640,i+1,13);\n"
+"  i=i+1;\n"
+" }\n"
+"}\n"
+"int ispit(int c) {\n"
+" if (c>=24 && c<=26) return 1;\n"
+" if (c>=50 && c<=52) return 1;\n"
+" if (c>=76 && c<=78) return 1;\n"
+" return 0;\n"
+"}\n"
+"void ground(int cam) {\n"
+" int i; int c; int g;\n"
+" i=0;\n"
+" while (i<21) {\n"
+"  c=cam/32+i;\n"
+"  g=c*32-cam;\n"
+"  if (ispit(c)==0) {\n"
+"   gfx_rect(g,420,32,5,10); gfx_rect(g,425,32,4,2); gfx_rect(g,429,32,51,6);\n"
+"   gfx_rect(g,429,32,1,12);\n"
+"   gfx_rect(g,445,32,2,5); gfx_rect(g,461,32,2,5);\n"
+"   gfx_rect(g+30,431,2,14,5); gfx_rect(g+14,447,2,14,5); gfx_rect(g+30,463,2,17,5);\n"
+"  }\n"
+"  i=i+1;\n"
+" }\n"
+"}\n"
+"void pbox(int c) {\n"
+" gfx_rect(190,150,260,110,0);\n"
+" gfx_rect(193,153,254,104,c);\n"
+"}\n"
 "void main() {\n"
-"    int px;\n"
-"    int py;\n"
-"    int vy;\n"
-"    int on_ground;\n"
-"    int quit;\n"
-"    int frame;\n"
-"    int i;\n"
-"    int k;\n"
-"    int nobs;\n"
-"    int obs[8];\n"
-"    int win;\n"
-"    int dead;\n"
-"    int dir;\n"
-"    int facing;\n"
-"    int walk_phase;\n"
-"    int moving;\n"
-"    int kiri;\n"
-"    int kanan;\n"
-"    int spasi_prev;\n"
-"    int spasi_sek;\n"
-"    int anim;\n"
-"\n"
-"    px = 60;\n"
-"    py = 0;\n"
-"    vy = 0;\n"
-"    on_ground = 1;\n"
-"    quit = 0;\n"
-"    frame = 0;\n"
-"    win = 0;\n"
-"    dead = 0;\n"
-"    dir = 0;\n"
-"    facing = 1;\n"
-"    walk_phase = 0;\n"
-"    moving = 0;\n"
-"    spasi_prev = 0;\n"
-"    anim = 0;\n"
-"    nobs = 4;\n"
-"    obs[0] = 240;\n"
-"    obs[1] = 360;\n"
-"    obs[2] = 460;\n"
-"    obs[3] = 560;\n"
-"\n"
-"    mouse_hide();\n"
-"    cursor(0);\n"
-"    while (poll() != 0) { }\n"
-"\n"
-"    while (quit == 0) {\n"
-"        k = poll();\n"
-"        if (k == 27) { quit = 1; }\n"
-"\n"
-"        kiri = key_down(30);\n"
-"        kanan = key_down(32);\n"
-"        spasi_sek = key_down(57);\n"
-"\n"
-"        if (spasi_sek == 1 && spasi_prev == 0) {\n"
-"            if (on_ground == 1) {\n"
-"                vy = 13;\n"
-"                on_ground = 0;\n"
-"            }\n"
-"        }\n"
-"        spasi_prev = spasi_sek;\n"
-"\n"
-"        dir = 0;\n"
-"        if (kiri == 1) dir = dir - 1;\n"
-"        if (kanan == 1) dir = dir + 1;\n"
-"\n"
-"        if (dir != 0) {\n"
-"            px = px + dir * 4;\n"
-"            facing = dir;\n"
-"            moving = 1;\n"
-"            if (px < 0) px = 0;\n"
-"            if (px > 590) px = 590;\n"
-"        } else {\n"
-"            moving = 0;\n"
-"        }\n"
-"\n"
-"        if (on_ground == 0) {\n"
-"            py = py + vy;\n"
-"            vy = vy - 1;\n"
-"            if (py <= 0) {\n"
-"                py = 0;\n"
-"                vy = 0;\n"
-"                on_ground = 1;\n"
-"            }\n"
-"        }\n"
-"\n"
-"        if (on_ground == 1 && dead == 0) {\n"
-"            i = 0;\n"
-"            while (i < nobs) {\n"
-"                if (px + 30 > obs[i] && px < obs[i] + 32) {\n"
-"                    dead = 1;\n"
-"                    gfx_rect(180, 180, 280, 100, 4);\n"
-"                    gfx_frame(180, 180, 280, 100, 0);\n"
-"                    gfx_frame(182, 182, 276, 96, 15);\n"
-"                    gfx_text(230, 210, \"GAME OVER\", 15);\n"
-"                    gfx_text(200, 240, \"Tekan ESC untuk keluar\", 15);\n"
-"                    beep(150, 600);\n"
-"                    while (poll() != 27) delay(50);\n"
-"                    quit = 1;\n"
-"                }\n"
-"                i = i + 1;\n"
-"            }\n"
-"        }\n"
-"\n"
-"        gfx_clear(9);\n"
-"\n"
-"        draw_cloud((frame / 2) % 700 - 60, 60);\n"
-"        draw_cloud((frame / 2 + 200) % 700 - 60, 90);\n"
-"        draw_cloud((frame / 2 + 400) % 700 - 60, 40);\n"
-"\n"
-"        gfx_rect(80, 380, 120, 40, 10);\n"
-"        gfx_rect(100, 360, 80, 20, 10);\n"
-"        gfx_rect(440, 380, 140, 40, 10);\n"
-"        gfx_rect(470, 360, 80, 20, 10);\n"
-"\n"
-"        gfx_rect(0, 420, 640, 60, 6);\n"
-"        gfx_rect(0, 436, 640, 44, 4);\n"
-"\n"
-"        i = 0;\n"
-"        while (i < 20) {\n"
-"            gfx_frame(i * 32, 420, 32, 16, 0);\n"
-"            gfx_frame(i * 32 + 16, 436, 32, 16, 0);\n"
-"            i = i + 1;\n"
-"        }\n"
-"\n"
-"        draw_pipe(200, 388, 32);\n"
-"        draw_pipe(500, 356, 64);\n"
-"\n"
-"        anim = (frame / 8) % 2;\n"
-"        draw_coin(120, 340, anim);\n"
-"        draw_coin(310, 320, 1 - anim);\n"
-"        draw_coin(450, 340, anim);\n"
-"\n"
-"        i = 0;\n"
-"        while (i < nobs) {\n"
-"            draw_question_block(obs[i], 320, (frame / 10 + i) % 2);\n"
-"            i = i + 1;\n"
-"        }\n"
-"\n"
-"        gfx_rect(615, 300, 4, 120, 7);\n"
-"        gfx_rect(580, 300, 35, 24, 12);\n"
-"        gfx_frame(580, 300, 35, 24, 0);\n"
-"        gfx_text(586, 306, \"GOAL\", 15);\n"
-"\n"
-"        if (moving == 1 && on_ground == 1) {\n"
-"            walk_phase = ((frame / 5) % 2) + 1;\n"
-"        } else if (on_ground == 1) {\n"
-"            walk_phase = 0;\n"
-"        }\n"
-"\n"
-"        draw_mario(px, 420 - py, walk_phase, facing, 1 - on_ground);\n"
-"\n"
-"        gfx_rect(0, 16, 640, 22, 0);\n"
-"        gfx_frame(0, 16, 640, 22, 15);\n"
-"        gfx_text(6, 20, \"MARIO   A/D gerak  SPASI lompat  ESC keluar\", 15);\n"
-"        gfx_text(490, 20, \"X:\", 14);\n"
-"        gfx_int(510, 20, px, 14);\n"
-"\n"
-"        if (px >= 580 && quit == 0) {\n"
-"            win = 1;\n"
-"            quit = 1;\n"
-"        }\n"
-"\n"
-"        frame = frame + 1;\n"
-"        delay(30);\n"
+" int px; int py; int vy; int oy; int ox; int og; int dir; int spd; int jk; int jp;\n"
+" int cam; int fr; int quit; int st; int dead; int inv; int lives; int score; int nc;\n"
+" int cp; int face; int pose; int i; int k; int sx; int dx; int dy; int cc; int t; int n;\n"
+" int bx[12]; int bh[12]; int bt[12];\n"
+" int ex[5]; int emin[5]; int emax[5]; int ed[5]; int ea[5]; int et[5];\n"
+" int cxw[18]; int cyh[18]; int got[18];\n"
+" bx[0]=416; bx[1]=448; bx[2]=480; bx[3]=1056; bx[4]=1088; bx[5]=1088;\n"
+" bx[6]=1824; bx[7]=1856; bx[8]=1888; bx[9]=2400; bx[10]=2432; bx[11]=2464;\n"
+" i=0;\n"
+" while (i<12) { bh[i]=96; bt[i]=0; i=i+1; }\n"
+" bh[5]=176; bt[1]=1; bt[4]=1; bt[5]=1; bt[7]=1; bt[10]=1;\n"
+" ex[0]=560; emin[0]=520; emax[0]=740;\n"
+" ex[1]=1000; emin[1]=940; emax[1]=1180;\n"
+" ex[2]=1480; emin[2]=1400; emax[2]=1560;\n"
+" ex[3]=2100; emin[3]=1950; emax[3]=2250;\n"
+" ex[4]=2650; emin[4]=2560; emax[4]=2800;\n"
+" i=0;\n"
+" while (i<5) { ed[i]=2-(i%2)*4; ea[i]=1; et[i]=0; i=i+1; }\n"
+" i=0;\n"
+" while (i<18) { cxw[i]=250+i*160; cyh[i]=60+(i%4)*22; got[i]=0; i=i+1; }\n"
+" px=40; py=0; vy=0; og=1; dir=0; face=1; jp=0; cam=0; fr=0; quit=0; st=0;\n"
+" dead=0; inv=0; lives=3; score=0; nc=0; cp=40;\n"
+" mouse_hide(); cursor(0);\n"
+" while (poll()!=0) { }\n"
+" pal_set(1,8,16,58); pal_set(2,3,30,4); pal_set(3,44,48,58); pal_set(4,60,6,6);\n"
+" pal_set(5,22,10,2); pal_set(6,44,22,8); pal_set(8,63,46,32); pal_set(9,10,30,60);\n"
+" pal_set(10,24,56,10); pal_set(11,24,44,63); pal_set(12,58,40,18);\n"
+" pal_set(13,44,56,63); pal_set(14,63,58,10);\n"
+" gfx_buf(1);\n"
+" while (quit==0) {\n"
+"  k=poll();\n"
+"  while (k!=0) {\n"
+"   if (k==27) quit=1;\n"
+"   if (k==10) { if (st==0) st=1; else if (st>1) quit=1; }\n"
+"   k=poll();\n"
+"  }\n"
+"  if (st==1) {\n"
+"   if (dead==0) {\n"
+"    dir=0;\n"
+"    if (key_down(30)||key_down(75)) dir=dir-1;\n"
+"    if (key_down(32)||key_down(77)) dir=dir+1;\n"
+"    spd=4;\n"
+"    if (key_down(42)||key_down(54)) spd=6;\n"
+"    jk=0;\n"
+"    if (key_down(57)||key_down(17)||key_down(72)) jk=1;\n"
+"    if (dir!=0) face=dir;\n"
+"    ox=px;\n"
+"    px=px+dir*spd;\n"
+"    if (px<0) px=0;\n"
+"    if (px>3176) px=3176;\n"
+"    i=0;\n"
+"    while (i<12) {\n"
+"     if (py<bh[i] && py+32>bh[i]-32 && px+21>bx[i] && px+3<bx[i]+32) px=ox;\n"
+"     i=i+1;\n"
 "    }\n"
-"\n"
-"    mouse_hide();\n"
-"    cls();\n"
-"    cursor(1);\n"
-"    if (win == 1) {\n"
-"        beep(1200, 100);\n"
-"        beep(1500, 100);\n"
-"        beep(1800, 300);\n"
-"        print(\"YOU WIN!\\n\");\n"
-"    } else {\n"
-"        print(\"Terima kasih sudah bermain!\\n\");\n"
+"    if (jk==1 && jp==0 && og==1) vy=16;\n"
+"    if (jk==0 && vy>6) vy=6;\n"
+"    jp=jk;\n"
+"    oy=py;\n"
+"    vy=vy-1;\n"
+"    if (vy<-14) vy=-14;\n"
+"    py=py+vy;\n"
+"    og=0;\n"
+"    cc=(px+12)/32;\n"
+"    if (vy<0 && oy>=0 && py<=0 && ispit(cc)==0) { py=0; vy=0; og=1; }\n"
+"    i=0;\n"
+"    while (i<12) {\n"
+"     if (px+21>bx[i] && px+3<bx[i]+32) {\n"
+"      if (vy<0 && oy>=bh[i] && py<=bh[i]) { py=bh[i]; vy=0; og=1; }\n"
+"      else if (vy>0 && oy+32<=bh[i]-32 && py+32>bh[i]-32) {\n"
+"       py=bh[i]-64; vy=0;\n"
+"       if (bt[i]==1) { bt[i]=2; nc=nc+1; score=score+200; beep(1600,12); }\n"
+"      }\n"
+"     }\n"
+"     i=i+1;\n"
 "    }\n"
-"}\n";
-
-/* ============================================================
- * 9f-b3. RAYCAST ZOMBIE (embedded .wc)
- * ============================================================ */
-static const char zombie_src[] =
-"void main() {\n"
-"    int map[256];\n"
-"    int cos_tab[64];\n"
-"    int sin_tab[64];\n"
-"    int wall_d[64];\n"
-"    int zx[6];\n"
-"    int zy[6];\n"
-"    int za[6];\n"
-"    int px;\n"
-"    int py;\n"
-"    int dir_i;\n"
-"    int quit;\n"
-"    int k;\n"
-"    int col;\n"
-"    int cam_x;\n"
-"    int rdx;\n"
-"    int rdy;\n"
-"    int rx;\n"
-"    int ry;\n"
-"    int mcx;\n"
-"    int mcy;\n"
-"    int step;\n"
-"    int wdist;\n"
-"    int wall_h;\n"
-"    int y0;\n"
-"    int wcol;\n"
-"    int npx;\n"
-"    int npy;\n"
-"    int turn_cd;\n"
-"    int i;\n"
-"    int score;\n"
-"    int z;\n"
-"    int rel_x;\n"
-"    int rel_y;\n"
-"    int fwd;\n"
-"    int rgt;\n"
-"    int sx;\n"
-"    int size;\n"
-"    int ztop;\n"
-"    int fire_cd;\n"
-"    int frame;\n"
-"    int hit;\n"
-"\n"
-"    cos_tab[0] = 256; cos_tab[1] = 255; cos_tab[2] = 251; cos_tab[3] = 245;\n"
-"    cos_tab[4] = 237; cos_tab[5] = 226; cos_tab[6] = 213; cos_tab[7] = 198;\n"
-"    cos_tab[8] = 181; cos_tab[9] = 162; cos_tab[10] = 142; cos_tab[11] = 121;\n"
-"    cos_tab[12] = 98; cos_tab[13] = 74; cos_tab[14] = 50; cos_tab[15] = 25;\n"
-"    cos_tab[16] = 0; cos_tab[17] = -25; cos_tab[18] = -50; cos_tab[19] = -74;\n"
-"    cos_tab[20] = -98; cos_tab[21] = -121; cos_tab[22] = -142; cos_tab[23] = -162;\n"
-"    cos_tab[24] = -181; cos_tab[25] = -198; cos_tab[26] = -213; cos_tab[27] = -226;\n"
-"    cos_tab[28] = -237; cos_tab[29] = -245; cos_tab[30] = -251; cos_tab[31] = -255;\n"
-"    cos_tab[32] = -256; cos_tab[33] = -255; cos_tab[34] = -251; cos_tab[35] = -245;\n"
-"    cos_tab[36] = -237; cos_tab[37] = -226; cos_tab[38] = -213; cos_tab[39] = -198;\n"
-"    cos_tab[40] = -181; cos_tab[41] = -162; cos_tab[42] = -142; cos_tab[43] = -121;\n"
-"    cos_tab[44] = -98; cos_tab[45] = -74; cos_tab[46] = -50; cos_tab[47] = -25;\n"
-"    cos_tab[48] = 0; cos_tab[49] = 25; cos_tab[50] = 50; cos_tab[51] = 74;\n"
-"    cos_tab[52] = 98; cos_tab[53] = 121; cos_tab[54] = 142; cos_tab[55] = 162;\n"
-"    cos_tab[56] = 181; cos_tab[57] = 198; cos_tab[58] = 213; cos_tab[59] = 226;\n"
-"    cos_tab[60] = 237; cos_tab[61] = 245; cos_tab[62] = 251; cos_tab[63] = 255;\n"
-"\n"
-"    sin_tab[0] = 0; sin_tab[1] = 25; sin_tab[2] = 50; sin_tab[3] = 74;\n"
-"    sin_tab[4] = 98; sin_tab[5] = 121; sin_tab[6] = 142; sin_tab[7] = 162;\n"
-"    sin_tab[8] = 181; sin_tab[9] = 198; sin_tab[10] = 213; sin_tab[11] = 226;\n"
-"    sin_tab[12] = 237; sin_tab[13] = 245; sin_tab[14] = 251; sin_tab[15] = 255;\n"
-"    sin_tab[16] = 256; sin_tab[17] = 255; sin_tab[18] = 251; sin_tab[19] = 245;\n"
-"    sin_tab[20] = 237; sin_tab[21] = 226; sin_tab[22] = 213; sin_tab[23] = 198;\n"
-"    sin_tab[24] = 181; sin_tab[25] = 162; sin_tab[26] = 142; sin_tab[27] = 121;\n"
-"    sin_tab[28] = 98; sin_tab[29] = 74; sin_tab[30] = 50; sin_tab[31] = 25;\n"
-"    sin_tab[32] = 0; sin_tab[33] = -25; sin_tab[34] = -50; sin_tab[35] = -74;\n"
-"    sin_tab[36] = -98; sin_tab[37] = -121; sin_tab[38] = -142; sin_tab[39] = -162;\n"
-"    sin_tab[40] = -181; sin_tab[41] = -198; sin_tab[42] = -213; sin_tab[43] = -226;\n"
-"    sin_tab[44] = -237; sin_tab[45] = -245; sin_tab[46] = -251; sin_tab[47] = -255;\n"
-"    sin_tab[48] = -256; sin_tab[49] = -255; sin_tab[50] = -251; sin_tab[51] = -245;\n"
-"    sin_tab[52] = -237; sin_tab[53] = -226; sin_tab[54] = -213; sin_tab[55] = -198;\n"
-"    sin_tab[56] = -181; sin_tab[57] = -162; sin_tab[58] = -142; sin_tab[59] = -121;\n"
-"    sin_tab[60] = -98; sin_tab[61] = -74; sin_tab[62] = -50; sin_tab[63] = -25;\n"
-"\n"
-"    i = 0;\n"
-"    while (i < 256) { map[i] = 0; i = i + 1; }\n"
-"    i = 0;\n"
-"    while (i < 16) {\n"
-"        map[i] = 1;\n"
-"        map[15 * 16 + i] = 1;\n"
-"        map[i * 16] = 1;\n"
-"        map[i * 16 + 15] = 1;\n"
-"        i = i + 1;\n"
+"    i=0;\n"
+"    while (i<5) {\n"
+"     if (ea[i]==1) {\n"
+"      ex[i]=ex[i]+ed[i];\n"
+"      if (ex[i]<emin[i]) { ex[i]=emin[i]; ed[i]=2; }\n"
+"      if (ex[i]>emax[i]) { ex[i]=emax[i]; ed[i]=-2; }\n"
+"      if (dead==0 && px+21>ex[i]+1 && px+3<ex[i]+23 && py<22) {\n"
+"       if (vy<0 && oy>=14) { ea[i]=2; et[i]=25; vy=9; score=score+100; beep(500,20); }\n"
+"       else if (inv==0) { dead=1; vy=12; beep(250,40); }\n"
+"      }\n"
+"     } else if (ea[i]==2) {\n"
+"      et[i]=et[i]-1;\n"
+"      if (et[i]<=0) ea[i]=0;\n"
+"     }\n"
+"     i=i+1;\n"
 "    }\n"
-"    map[3*16 + 3] = 1; map[3*16 + 4] = 1; map[3*16 + 5] = 1; map[3*16 + 6] = 1;\n"
-"    map[5*16 + 8] = 1; map[5*16 + 9] = 1; map[5*16 + 10] = 1; map[5*16 + 11] = 1;\n"
-"    map[7*16 + 2] = 1; map[7*16 + 3] = 1; map[7*16 + 4] = 1;\n"
-"    map[9*16 + 10] = 1; map[9*16 + 11] = 1;\n"
-"    map[11*16 + 5] = 1; map[11*16 + 6] = 1; map[11*16 + 7] = 1;\n"
-"    map[11*16 + 8] = 1; map[11*16 + 9] = 1;\n"
-"    map[13*16 + 4] = 1; map[13*16 + 5] = 1;\n"
-"    map[13*16 + 11] = 1; map[13*16 + 12] = 1;\n"
-"\n"
-"    zx[0] = 8*256 + 128;  zy[0] = 8*256 + 128;\n"
-"    zx[1] = 12*256 + 128; zy[1] = 2*256 + 128;\n"
-"    zx[2] = 2*256 + 128;  zy[2] = 12*256 + 128;\n"
-"    zx[3] = 13*256 + 128; zy[3] = 13*256 + 128;\n"
-"    zx[4] = 6*256 + 128;  zy[4] = 3*256 + 128;\n"
-"    zx[5] = 3*256 + 128;  zy[5] = 9*256 + 128;\n"
-"    za[0] = 1; za[1] = 1; za[2] = 1; za[3] = 1; za[4] = 1; za[5] = 1;\n"
-"\n"
-"    px = 4 * 256 + 128;\n"
-"    py = 4 * 256 + 128;\n"
-"    dir_i = 0;\n"
-"    quit = 0; turn_cd = 0; score = 0; fire_cd = 0; frame = 0;\n"
-"\n"
-"    mouse_hide();\n"
-"    cursor(0);\n"
-"    while (poll() != 0) { }\n"
-"\n"
-"    while (quit == 0) {\n"
-"        k = poll();\n"
-"        if (k == 27) { quit = 1; }\n"
-"\n"
-"        if (key_down(17)) {\n"
-"            npx = px + cos_tab[dir_i] / 12;\n"
-"            npy = py + sin_tab[dir_i] / 12;\n"
-"            if (map[(npx / 256) * 16 + (py / 256)] == 0) { px = npx; }\n"
-"            if (map[(px / 256) * 16 + (npy / 256)] == 0) { py = npy; }\n"
-"        }\n"
-"        if (key_down(31)) {\n"
-"            npx = px - cos_tab[dir_i] / 12;\n"
-"            npy = py - sin_tab[dir_i] / 12;\n"
-"            if (map[(npx / 256) * 16 + (py / 256)] == 0) { px = npx; }\n"
-"            if (map[(px / 256) * 16 + (npy / 256)] == 0) { py = npy; }\n"
-"        }\n"
-"        if (turn_cd > 0) { turn_cd = turn_cd - 1; }\n"
-"        if (turn_cd == 0) {\n"
-"            if (key_down(30)) {\n"
-"                dir_i = dir_i - 1;\n"
-"                if (dir_i < 0) { dir_i = dir_i + 64; }\n"
-"                turn_cd = 3;\n"
-"            }\n"
-"            if (key_down(32)) {\n"
-"                dir_i = dir_i + 1;\n"
-"                if (dir_i >= 64) { dir_i = dir_i - 64; }\n"
-"                turn_cd = 3;\n"
-"            }\n"
-"        }\n"
-"\n"
-"        if (fire_cd > 0) { fire_cd = fire_cd - 1; }\n"
-"        if (key_down(57) && fire_cd == 0) {\n"
-"            beep(900, 30);\n"
-"            fire_cd = 8;\n"
-"            hit = 0;\n"
-"            z = 0;\n"
-"            while (z < 6) {\n"
-"                if (za[z] == 1) {\n"
-"                    rel_x = zx[z] - px;\n"
-"                    rel_y = zy[z] - py;\n"
-"                    fwd = (rel_x * cos_tab[dir_i] + rel_y * sin_tab[dir_i]) / 256;\n"
-"                    if (fwd > 64 && fwd < 1200) {\n"
-"                        rgt = (rel_x * (-sin_tab[dir_i]) + rel_y * cos_tab[dir_i]) / 256;\n"
-"                        sx = 320 + (rgt * 320) / fwd;\n"
-"                        if (sx > 280 && sx < 360) {\n"
-"                            za[z] = 0;\n"
-"                            score = score + 100;\n"
-"                            hit = 1;\n"
-"                        }\n"
-"                    }\n"
-"                }\n"
-"                z = z + 1;\n"
-"            }\n"
-"            if (hit == 1) { beep(1600, 40); }\n"
-"        }\n"
-"\n"
-"        gfx_clear(0);\n"
-"        gfx_rect(0, 0, 640, 240, 9);\n"
-"        gfx_rect(0, 240, 640, 240, 6);\n"
-"\n"
-"        col = 0;\n"
-"        while (col < 64) {\n"
-"            cam_x = (col * 512) / 64 - 256;\n"
-"            rdx = cos_tab[dir_i] + ((-sin_tab[dir_i] * 148) / 256) * cam_x / 256;\n"
-"            rdy = sin_tab[dir_i] + ((cos_tab[dir_i] * 148) / 256) * cam_x / 256;\n"
-"            rx = px;\n"
-"            ry = py;\n"
-"            step = 0;\n"
-"            while (step < 200) {\n"
-"                mcx = rx / 256;\n"
-"                mcy = ry / 256;\n"
-"                if (mcx < 0) { step = 999; }\n"
-"                else if (mcx > 15) { step = 999; }\n"
-"                else if (mcy < 0) { step = 999; }\n"
-"                else if (mcy > 15) { step = 999; }\n"
-"                else if (map[mcy * 16 + mcx] == 1) { step = 999; }\n"
-"                else {\n"
-"                    rx = rx + rdx / 8;\n"
-"                    ry = ry + rdy / 8;\n"
-"                    step = step + 1;\n"
-"                }\n"
-"            }\n"
-"            wdist = ((rx - px) * cos_tab[dir_i] + (ry - py) * sin_tab[dir_i]) / 256;\n"
-"            if (wdist < 16) { wdist = 16; }\n"
-"            wall_d[col] = wdist;\n"
-"            wall_h = 51200 / wdist;\n"
-"            if (wall_h > 480) { wall_h = 480; }\n"
-"            y0 = 240 - wall_h / 2;\n"
-"            if (y0 < 0) { wall_h = wall_h + y0; y0 = 0; }\n"
-"            if (y0 + wall_h > 480) { wall_h = 480 - y0; }\n"
-"            wcol = 7;\n"
-"            if ((mcx + mcy) % 2 == 0) { wcol = 8; }\n"
-"            if (wdist > 900) { wcol = 8; }\n"
-"            if (wall_h > 0) {\n"
-"                gfx_rect(col * 10, y0, 10, wall_h, wcol);\n"
-"            }\n"
-"            col = col + 1;\n"
-"        }\n"
-"\n"
-"        z = 0;\n"
-"        while (z < 6) {\n"
-"            if (za[z] == 1) {\n"
-"                rel_x = zx[z] - px;\n"
-"                rel_y = zy[z] - py;\n"
-"                fwd = (rel_x * cos_tab[dir_i] + rel_y * sin_tab[dir_i]) / 256;\n"
-"                if (fwd > 128) {\n"
-"                    rgt = (rel_x * (-sin_tab[dir_i]) + rel_y * cos_tab[dir_i]) / 256;\n"
-"                    sx = 320 + (rgt * 320) / fwd;\n"
-"                    if (sx >= 0 && sx < 640) {\n"
-"                        col = sx / 10;\n"
-"                        if (col >= 0 && col < 64) {\n"
-"                            if (fwd < wall_d[col]) {\n"
-"                                size = 38400 / fwd;\n"
-"                                if (size < 8) { size = 8; }\n"
-"                                if (size > 400) { size = 400; }\n"
-"                                ztop = 240 - size / 2;\n"
-"                                if (ztop < 0) { ztop = 0; }\n"
-"                                if (ztop + size > 480) { size = 480 - ztop; }\n"
-"                                gfx_rect(sx - size / 4, ztop, size / 2, size, 4);\n"
-"                                gfx_rect(sx - size / 4, ztop, size / 2, size / 5, 12);\n"
-"                                gfx_rect(sx - size / 8, ztop + size / 3, size / 4, size / 8, 15);\n"
-"                                gfx_rect(sx - size / 12, ztop + size / 8, size / 8, size / 8, 0);\n"
-"                                gfx_rect(sx + size / 24, ztop + size / 8, size / 8, size / 8, 0);\n"
-"                            }\n"
-"                        }\n"
-"                    }\n"
-"                }\n"
-"            }\n"
-"            z = z + 1;\n"
-"        }\n"
-"\n"
-"        gfx_rect(314, 238, 12, 4, 15);\n"
-"        gfx_rect(318, 234, 4, 12, 15);\n"
-"        gfx_rect(318, 238, 4, 4, 4);\n"
-"\n"
-"        gfx_rect(0, 0, 640, 16, 0);\n"
-"        gfx_text(6, 0, \"Skor:\", 15);\n"
-"        gfx_int(56, 0, score, 14);\n"
-"        gfx_text(200, 0, \"RAYCAST ZOMBIE\", 12);\n"
-"        gfx_text(490, 0, \"W/S maju  A/D putar  Spasi tembak\", 7);\n"
-"\n"
-"        frame = frame + 1;\n"
-"        delay(16);\n"
+"    i=0;\n"
+"    while (i<18) {\n"
+"     if (got[i]==0) {\n"
+"      dx=px+12-cxw[i]-6;\n"
+"      dy=py+16-cyh[i];\n"
+"      if (dx>-20 && dx<20 && dy>-26 && dy<26) {\n"
+"       got[i]=1; nc=nc+1; score=score+50; beep(1500,12);\n"
+"      }\n"
+"     }\n"
+"     i=i+1;\n"
 "    }\n"
-"\n"
-"    mouse_hide();\n"
-"    cls();\n"
-"    cursor(1);\n"
-"    print(\"=== RAYCAST ZOMBIE ===\\n\");\n"
-"    print(\"Skor akhir: \");\n"
-"    print_int(score);\n"
-"    print(\"\\n\");\n"
-"    beep(1200, 100); beep(1500, 100); beep(1800, 200);\n"
-"}\n";
-
-
+"    if (px>1760 && cp<1760) cp=1760;\n"
+"    if (py<-70) { dead=30; vy=0; beep(220,60); }\n"
+"    if (px+12>=3040) { st=2; beep(1000,80); beep(1300,80); beep(1700,200); }\n"
+"    if (inv>0) inv=inv-1;\n"
+"   } else {\n"
+"    dead=dead+1;\n"
+"    py=py+vy;\n"
+"    vy=vy-1;\n"
+"    if (vy<-14) vy=-14;\n"
+"    if (dead>=90) {\n"
+"     lives=lives-1;\n"
+"     if (lives<=0) st=3;\n"
+"     else { px=cp; py=0; vy=0; og=1; dead=0; inv=100; }\n"
+"    }\n"
+"   }\n"
+"  }\n"
+"  cam=px-220;\n"
+"  if (cam<0) cam=0;\n"
+"  if (cam>2560) cam=2560;\n"
+"  sky();\n"
+"  t=cam/6; n=t/260;\n"
+"  i=0;\n"
+"  while (i<4) { sx=(n+i)*260+30-t; cloud(sx,36+((n+i)%3)*30); i=i+1; }\n"
+"  t=cam/3; n=t/480;\n"
+"  i=0;\n"
+"  while (i<3) { sx=(n+i)*480+40-t; hill(sx,420,3+((n+i)%2)*2); i=i+1; }\n"
+"  n=cam/400;\n"
+"  i=0;\n"
+"  while (i<3) { sx=(n+i)*400+250-cam; bush(sx,420); i=i+1; }\n"
+"  ground(cam);\n"
+"  i=0;\n"
+"  while (i<12) {\n"
+"   sx=bx[i]-cam;\n"
+"   if (sx>-32 && sx<640) block(sx,420-bh[i],bt[i]);\n"
+"   i=i+1;\n"
+"  }\n"
+"  i=0;\n"
+"  while (i<18) {\n"
+"   sx=cxw[i]-cam;\n"
+"   if (got[i]==0 && sx>-16 && sx<640) coin(sx,412-cyh[i],(fr/6)%4);\n"
+"   i=i+1;\n"
+"  }\n"
+"  flagpole(3040-cam);\n"
+"  i=0;\n"
+"  while (i<5) {\n"
+"   sx=ex[i]-cam;\n"
+"   if (sx>-24 && sx<640) {\n"
+"    if (ea[i]==1) goomba(sx,398,(fr/8)%2);\n"
+"    else if (ea[i]==2) {\n"
+"     gfx_rect(sx,412,24,8,6); gfx_rect(sx+2,416,20,4,12);\n"
+"     gfx_rect(sx+5,413,3,2,15); gfx_rect(sx+16,413,3,2,15);\n"
+"    }\n"
+"   }\n"
+"   i=i+1;\n"
+"  }\n"
+"  pose=0;\n"
+"  if (og==0 || dead>0) pose=2;\n"
+"  else if (dir!=0 && (fr/4)%2==1) pose=1;\n"
+"  t=0;\n"
+"  if (face<0) t=1;\n"
+"  if (inv==0 || (fr/3)%2==0) mario(px-cam,388-py,t,pose);\n"
+"  gfx_rect(0,16,640,20,0);\n"
+"  gfx_text(12,18,\"SKOR\",14); gfx_int(60,18,score,15);\n"
+"  gfx_text(176,18,\"KOIN\",14); gfx_int(224,18,nc,15);\n"
+"  gfx_text(292,18,\"NYAWA\",14); gfx_int(348,18,lives,15);\n"
+"  gfx_text(436,18,\"SPASI lompat ESC keluar\",7);\n"
+"  if (st==0) {\n"
+"   pbox(1);\n"
+"   gfx_text(236,164,\"S U P E R   M A R I O\",30);\n"
+"   gfx_text(256,184,\"WIDHY OS EDITION\",31);\n"
+"   gfx_text(232,206,\"A/D gerak SPASI lompat\",31);\n"
+"   gfx_text(228,226,\"ENTER mulai  ESC keluar\",30);\n"
+"  } else if (st==2) {\n"
+"   pbox(2);\n"
+"   gfx_text(272,166,\"KAMU MENANG!\",46);\n"
+"   gfx_text(248,194,\"SKOR\",47); gfx_int(296,194,score,47);\n"
+"   gfx_text(264,226,\"ENTER keluar\",47);\n"
+"  } else if (st==3) {\n"
+"   pbox(4);\n"
+"   gfx_text(284,166,\"GAME OVER\",78);\n"
+"   gfx_text(248,194,\"SKOR\",79); gfx_int(296,194,score,79);\n"
+"   gfx_text(264,226,\"ENTER keluar\",79);\n"
+"  }\n"
+"  gfx_flip();\n"
+"  fr=fr+1;\n"
+"  delay(16);\n"
+" }\n"
+" gfx_buf(0);\n"
+" pal_reset();\n"
+" mouse_hide();\n"
+" cls();\n"
+" cursor(1);\n"
+" print(\"Terima kasih sudah bermain!\\n\");\n"
+"}\n"
+;
 
 static void run_wc_mem(const char *src) {
     int n = 0;
@@ -3288,6 +3135,7 @@ static void run_wc_mem(const char *src) {
     int mi = find_fn("main");
     void (*f)(void) = (void (*)(void))(dc + wc_fns[mi].off);
     f();
+    gd = fb;   /* jaga-jaga jika program lupa gfx_buf(0) */
 }
 
 static void ensure_wc_file(const char *name, const char *src) {
@@ -3309,7 +3157,6 @@ static void ensure_wc_file(const char *name, const char *src) {
 }
 
 static void cmd_mario(void) { run_wc_mem(mario_src); }
-static void cmd_zombie(void) { run_wc_mem(zombie_src); }
 
 /* ============================================================
  * 9f-c. WIDHY PAINT - native app, simpan .wpg (RLE)
@@ -3577,7 +3424,7 @@ static void run_command(const char *cmd){
     con_puts("Folder   : pwd, cd, mkdir, rmdir, ls [path]\n");
     con_puts("Berkas   : cat, write, append, cp, mv, rm [-r], nano\n");
     con_puts("Widhy Comp: wcc <sumber> [keluaran] | wrun [berkas]\n");
-    con_puts("            mario  (game grafis: a/d/spasi/ESC)\n");
+    con_puts("            mario  (game grafis: a/d/spasi/Shift/ESC)\n");
     con_puts("Paint    : paint [nama.wpg]   (kiri=draw, kanan=erase)\n");
     con_puts("           Ctrl+S simpan, Ctrl+O buka, Ctrl+N baru, ESC keluar\n");
     con_puts("  Fitur: int/char/void, array, fungsi, if/else, while, for,\n");
@@ -3587,6 +3434,7 @@ static void run_command(const char *cmd){
     con_puts("           gfx_clear gfx_rect gfx_frame gfx_text gfx_int\n");
     con_puts("           mouse_x mouse_y mouse_btn mouse_hide mouse_show\n");
     con_puts("           panel_save panel_restore ui_button ui_button_hit\n");
+    con_puts("           gfx_buf gfx_flip pal_set pal_reset\n");
   } else if(str_equal(cmd, "date") || str_equal(cmd, "jam")){
     rtc_time_t t;
     char s[20];
@@ -3631,8 +3479,6 @@ static void run_command(const char *cmd){
     cmd_button(args);
   } else if (str_equal(cmd, "mario")) {
     cmd_mario();
-  } else if (str_equal(cmd, "zombie") || str_equal(cmd, "raycast")) {
-    cmd_zombie(); 
   } else if (str_equal(cmd, "paint")) {
     paint_run(0);
   } else if (strncmp_(cmd, "paint ", 6) == 0) {
@@ -3675,6 +3521,7 @@ void kmain(void) {
     print_prompt();
     idt_init();
     pic_init();
+    pit_init();
     mouse_init();
     __asm__ volatile ("sti");
     char line[128];
@@ -3725,7 +3572,7 @@ void kmain(void) {
             mouse_show();
         }
         clock_tick();
-        if (widhy_cursor_state && ticks - last_blink >= 9) {
+        if (widhy_cursor_state && ticks - last_blink >= TICK_HZ / 2) {
             last_blink = ticks;
             cursor_on ^= 1;
             mouse_hide();
@@ -3739,4 +3586,3 @@ void kmain(void) {
             __asm__ volatile ("sti");
     }
 }
-
